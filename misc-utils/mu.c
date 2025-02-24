@@ -1,6 +1,7 @@
 /* mu -- summarize memory usage
-   Copyright (C) 2025 Free Software Foundation, Inc.
 
+   Copyright (C) 2025
+   Author(s): Xiaofei Du <xiaofeidu@meta.com>, Matteo Croce <teknoraver@meta.com>
    This program is free software: you can redistribute it and/or modify
    it under the terms of the GNU General Public License as published by
    the Free Software Foundation, either version 3 of the License, or
@@ -18,36 +19,29 @@
 #include <getopt.h>
 #include <sys/types.h>
 
-#include "system.h"
-#include "argmatch.h"
-#include "argv-iter.h"
-#include "assure.h"
-#include "di-set.h"
-#include "exclude.h"
-#include "fprintftime.h"
-#include "human.h"
-#include "mountlist.h"
-#include "quote.h"
-#include "stat-size.h"
-#include "stat-time.h"
-#include "stdio--.h"
-#include "xfts.h"
-#include "xstrtol.h"
-#include "xstrtol-error.h"
+#include <stdbool.h>
+#include <stdint.h>
+#include <limits.h>
+#include <error.h>
 
 #include <fcntl.h>
 #include <linux/mman.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
 #include <unistd.h>
+#include <search.h>
+#include <fts.h>
+#include <libmount.h>
+
+#include "c.h"
+#include "nls.h"
+#include "strutils.h"
+#include "closestream.h"
 
 extern bool fts_debug;
 
 /* The official name of this program (e.g., no 'g' prefix).  */
 #define PROGRAM_NAME "mu"
-
-#define AUTHORS \
-  proper_name ("Xiaofei Du")
 
 #if DU_DEBUG
 #define FTS_CROSS_CHECK(Fts) fts_cross_check (Fts)
@@ -55,12 +49,19 @@ extern bool fts_debug;
 #define FTS_CROSS_CHECK(Fts)
 #endif
 
+#define LONGEST_HUMAN_READABLE \
+  ((2 * sizeof (uintmax_t) * CHAR_BIT * 146 / 485 + 1) * (MB_LEN_MAX + 1) \
+   - MB_LEN_MAX + 1 + 3)
+
+#define SAME_SIZE(a, b)	(ARRAY_SIZE(a) == ARRAY_SIZE(b))
+#define SET_SIZE 11 * 1021
+
 /* A set of dev/ino pairs to help identify files and directories
    whose sizes have already been counted.  */
-static struct di_set *di_files;
+static struct hsearch_data di_files;
 
 /* A set containing a dev/ino pair for each local mount point directory.  */
-static struct di_set *di_mnt;
+static struct hsearch_data di_mnt;
 
 /* Keep track of the preceding "level" (depth in hierarchy)
    from one call of process_file to the next.  */
@@ -81,6 +82,25 @@ cachestat(int fd, struct cachestat_range *cstat_range, struct cachestat *cstat, 
 	return syscall(__NR_cachestat, fd, cstat_range, cstat, flags);
 }
 
+/* When fts_read returns FTS_DC to indicate a directory cycle,
+   it may or may not indicate a real problem.  When a program like
+   chgrp performs a recursive traversal that requires traversing
+   symbolic links, it is *not* a problem.  However, when invoked
+   with "-P -R", it deserves a warning.  The fts_options member
+   records the options that control this aspect of fts's behavior,
+   so test that.  */
+static bool
+cycle_warning_required (FTS const *fts, FTSENT const *ent)
+{
+#define ISSET(Fts,Opt) ((Fts)->fts_options & (Opt))
+  /* When dereferencing no symlinks, or when dereferencing only
+     those listed on the command line and we're not processing
+     a command-line argument, then a cycle is a serious problem. */
+  return ((ISSET (fts, FTS_PHYSICAL) && !ISSET (fts, FTS_COMFOLLOW))
+          || (ISSET (fts, FTS_PHYSICAL) && ISSET (fts, FTS_COMFOLLOW)
+              && ent->fts_level != FTS_ROOTLEVEL));
+}
+
 static inline void muinfo_init(struct muinfo *mui)
 {
 	mui->cache_size = 0;
@@ -88,7 +108,7 @@ static inline void muinfo_init(struct muinfo *mui)
 	mui->writeback_size = 0;
 	mui->evicted_size = 0;
 	mui->recently_evicted_size = 0;
-	mui->tmax.tv_sec = TYPE_MINIMUM(time_t);
+	mui->tmax.tv_sec = (time_t)LLONG_MIN;
 	mui->tmax.tv_nsec = -1;
 }
 
@@ -109,7 +129,7 @@ static inline void muinfo_add(struct muinfo *first, const struct muinfo *second)
 	sum = first->recently_evicted_size + second->recently_evicted_size;
 	first->recently_evicted_size = first->recently_evicted_size <= sum ? sum : UINTMAX_MAX;
 
-	if (timespec_cmp(first->tmax, second->tmax) < 0)
+	if (cmp_timespec(&first->tmax, &second->tmax, <))
 		first->tmax = second->tmax;
 }
 
@@ -139,14 +159,14 @@ static bool opt_separate_dirs = false;
 /* Show the total for each directory (and file if --all) that is at
    most MAX_DEPTH levels down from the root of the hierarchy.  The root
    is at level 0, so 'mu --max-depth=0' is equivalent to 'mu -s'.  */
-static idx_t max_depth = IDX_MAX;
+static size_t max_depth = SIZE_MAX;
 
 /* Only output entries with at least this SIZE if positive,
    or at most if negative.  See --threshold option.  */
 static intmax_t opt_threshold = 0;
 
 /* Human-readable options for output.  */
-static int human_output_opts;
+static int human_readable;
 
 /* If true, print most recently modified date, using the specified format.  */
 static bool opt_time = false;
@@ -162,21 +182,14 @@ enum time_type {
 static enum time_type time_type = time_mtime;
 
 /* User specified date / time style */
-static char const *time_style = nullptr;
+static char const *time_style = NULL;
 
 /* Format used to display date / time. Controlled by --time-style */
-static char const *time_format = nullptr;
-
-/* The local time zone rules, as per the TZ environment variable.  */
-static timezone_t localtz;
-
-/* The units to use when printing sizes.  */
-static uintmax_t output_block_size;
-
-/* File name patterns to exclude.  */
-static struct exclude *exclude;
+static char const *time_format = NULL;
 
 static struct muinfo tot_mui;
+
+static int call_dir;
 
 #define IS_DIR_TYPE(Type)	\
   ((Type) == FTS_DP		\
@@ -185,52 +198,43 @@ static struct muinfo tot_mui;
 /* For long options that have no equivalent short option, use a
    non-character as a pseudo short option, starting with CHAR_MAX + 1.  */
 enum {
-	EXCLUDE_OPTION = CHAR_MAX + 1,
-	FILES0_FROM_OPTION,
-	HUMAN_SI_OPTION,
-	FTS_DEBUG,
+	FTS_DEBUG = CHAR_MAX + 1,
 	TIME_OPTION,
 	TIME_STYLE_OPTION,
 };
 
 static struct option const long_options[] = {
-	{"all", no_argument, nullptr, 'a'},
-	{"block-size", required_argument, nullptr, 'B'},
-	{"bytes", no_argument, nullptr, 'b'},
-	{"count-links", no_argument, nullptr, 'l'},
-	/* {"-debug", no_argument, nullptr, FTS_DEBUG}, */
-	{"dereference", no_argument, nullptr, 'L'},
-	{"dereference-args", no_argument, nullptr, 'D'},
-	{"exclude", required_argument, nullptr, EXCLUDE_OPTION},
-	{"exclude-from", required_argument, nullptr, 'X'},
-	{"files0-from", required_argument, nullptr, FILES0_FROM_OPTION},
-	{"human-readable", no_argument, nullptr, 'h'},
-	{"si", no_argument, nullptr, HUMAN_SI_OPTION},
-	{"max-depth", required_argument, nullptr, 'd'},
-	{"null", no_argument, nullptr, '0'},
-	{"no-dereference", no_argument, nullptr, 'P'},
-	{"one-file-system", no_argument, nullptr, 'x'},
-	{"separate-dirs", no_argument, nullptr, 'S'},
-	{"summarize", no_argument, nullptr, 's'},
-	{"total", no_argument, nullptr, 'c'},
-	{"threshold", required_argument, nullptr, 't'},
-	{"time", optional_argument, nullptr, TIME_OPTION},
-	{"time-style", required_argument, nullptr, TIME_STYLE_OPTION},
-	{"format", required_argument, nullptr, 'f'},
-	{GETOPT_HELP_OPTION_DECL},
-	{GETOPT_VERSION_OPTION_DECL},
-	{nullptr, 0, nullptr, 0}
+	{"all", no_argument, NULL, 'a'},
+	{"count-links", no_argument, NULL, 'l'},
+	/* {"-debug", no_argument, NULL, FTS_DEBUG}, */
+	{"dereference", no_argument, NULL, 'L'},
+	{"dereference-args", no_argument, NULL, 'D'},
+	{"human-readable", no_argument, NULL, 'h'},
+	{"max-depth", required_argument, NULL, 'd'},
+	{"null", no_argument, NULL, '0'},
+	{"no-dereference", no_argument, NULL, 'P'},
+	{"one-file-system", no_argument, NULL, 'x'},
+	{"separate-dirs", no_argument, NULL, 'S'},
+	{"summarize", no_argument, NULL, 's'},
+	{"total", no_argument, NULL, 'c'},
+	{"threshold", required_argument, NULL, 't'},
+	{"time", optional_argument, NULL, TIME_OPTION},
+	{"time-style", required_argument, NULL, TIME_STYLE_OPTION},
+	{"format", required_argument, NULL, 'f'},
+	{"help", no_argument, NULL, CHAR_MIN - 2},
+	{"version", no_argument, NULL, CHAR_MIN - 3},
+	{NULL, 0, NULL, 0}
 };
 
 static char const *const time_args[] = {
-	"atime", "access", "use", "ctime", "status", nullptr
+	"atime", "access", "use", "ctime", "status"
 };
 
 static enum time_type const time_types[] = {
 	time_atime, time_atime, time_atime, time_ctime, time_ctime
 };
 
-ARGMATCH_VERIFY(time_args, time_types);
+static_assert(SAME_SIZE(time_args, time_types));
 
 /* 'full-iso' uses full ISO-style dates and times.  'long-iso' uses longer
    ISO-style timestamps, though shorter than 'full-iso'.  'iso' uses shorter
@@ -242,29 +246,29 @@ enum time_style {
 };
 
 static char const *const time_style_args[] = {
-	"full-iso", "long-iso", "iso", nullptr
+	"full-iso", "long-iso", "iso"
 };
 
 static enum time_style const time_style_types[] = {
 	full_iso_time_style, long_iso_time_style, iso_time_style
 };
 
-ARGMATCH_VERIFY(time_style_args, time_style_types);
+static_assert(SAME_SIZE(time_style_args, time_style_types));
 
-void usage(int status)
+static void usage(int status)
 {
-	if (status != EXIT_SUCCESS)
-		emit_try_help();
-	else {
-		printf(_("\
-Usage: %s [OPTION]... [FILE]...\n\
-  or:  %s [OPTION]... --files0-from=F\n\
-"), program_name, program_name);
+	if (status != EXIT_SUCCESS) {
+		fputs(_("Try '" PROGRAM_NAME " --help' for more information.\n"), stderr);
+	} else {
+		puts(_("\
+Usage: " PROGRAM_NAME " [OPTION]... [FILE]...\n\
+  or:  " PROGRAM_NAME " [OPTION]... --files0-from=F"));
 		fputs(_("\
 Summarize memory usage of the set of FILEs, recursively for directories.\n\
 "), stdout);
 
-		emit_mandatory_arg_note();
+		puts(_("\n\
+Mandatory arguments to long options are mandatory for short options too."));
 
 		fputs(_("\
   -0, --null            end each output line with NUL, not newline\n\
@@ -321,8 +325,8 @@ Summarize memory usage of the set of FILEs, recursively for directories.\n\
       --exclude=PATTERN    exclude files that match PATTERN\n\
   -x, --one-file-system    skip directories on different file systems\n\
 "), stdout);
-		fputs(HELP_OPTION_DESCRIPTION, stdout);
-		fputs(VERSION_OPTION_DESCRIPTION, stdout);
+		puts("      --help        display this help and exit");
+		puts("      --version     output version information and exit");
 		fputs(_("\n\
 The valid format sequences are:\n\
 \n\
@@ -335,21 +339,41 @@ The valid format sequences are:\n\
          'recent past' is defined by the memory that has been evicted since\n\
          the memory in question was forced out\n\
 "), stdout);
-		emit_blocksize_note("MU");
-		emit_size_note();
-		emit_ancillary_info(PROGRAM_NAME);
+		puts(_("\n\
+Display values are in units of the first available SIZE from --block-size,\n\
+and the " PROGRAM_NAME "_BLOCK_SIZE, BLOCK_SIZE and BLOCKSIZE environment variables.\n\
+Otherwise, units default to 1024 bytes (or 512 if POSIXLY_CORRECT is set)."));
+		puts(_("\n\
+The SIZE argument is an integer and optional unit (example: 10K is 10*1024).\n\
+Units are K,M,G,T,P,E,Z,Y,R,Q (powers of 1024) or KB,MB,... (powers of 1000).\n\
+Binary prefixes can be used, too: KiB=K, MiB=M, and so on."));
 	}
 	exit(status);
+}
+
+/* TODO: remove and use xalloc() in the allocators */
+static void xalloc_die(void)
+{
+	err(EXIT_FAILURE, _("ENOMEM"));
 }
 
 /* Try to insert the INO/DEV pair into DI_SET.
    Return true if the pair is successfully inserted,
    false if the pair was already there.  */
-static bool hash_ins(struct di_set *di_set, ino_t ino, dev_t dev)
+static bool hash_ins(struct hsearch_data *di_hash, ino_t ino, dev_t dev)
 {
-	int inserted = di_set_insert(di_set, dev, ino);
-	if (inserted < 0)
+	ENTRY key, *val;
+	char dev_s[32];
+
+	snprintf(dev_s, sizeof(dev_s), "%ju,%ju", (uintmax_t)dev, (uintmax_t)ino);
+	key.key = dev_s;
+
+	int inserted = hsearch_r(key, ENTER, &val, di_hash);
+	if (inserted == 0)
 		xalloc_die();
+
+	val->data = (void *)(uintptr_t)1;
+
 	return inserted;
 }
 
@@ -357,26 +381,37 @@ static bool hash_ins(struct di_set *di_set, ino_t ino, dev_t dev)
 /* Display the date and time in WHEN according to the format specified
    in FORMAT.  */
 
-static void show_date(char const *format, struct timespec when, timezone_t tz)
+static void show_date(char const *format, struct timespec when)
 {
 	struct tm tm;
-	if (localtime_rz(tz, &when.tv_sec, &tm))
-		fprintftime(stdout, format, &tm, tz, when.tv_nsec);
-	else {
-		char buf[INT_BUFSIZE_BOUND(intmax_t)];
-		char *when_str = timetostr(when.tv_sec, buf);
-		error(0, 0, _("time %s is out of range"), quote(when_str));
-		fputs(when_str, stdout);
-	}
+
+	if (localtime_r(&when.tv_sec, &tm)) {
+		char fmt[64];
+		strftime(fmt, sizeof(fmt), format, &tm);
+		fputs(fmt, stdout);
+	} else
+		fprintf(stderr, "time %ld is out of range\n", when.tv_sec);
 }
 
 /* Print N_BYTES.  Convert it to a readable value before printing.  */
 
 static void print_only_size(uintmax_t n_bytes)
 {
-	char buf[LONGEST_HUMAN_READABLE + 1];
-	fputs((n_bytes == UINTMAX_MAX ? _("Infinity")
-	       : human_readable(n_bytes, buf, human_output_opts, 1, output_block_size)), stdout);
+	if (n_bytes == UINTMAX_MAX) {
+		fputs(_("Infinity"), stdout);
+		return;
+	}
+
+	if (human_readable) {
+		char *str = size_to_human_string(SIZE_SUFFIX_1LETTER, n_bytes);
+		if (str) {
+			fputs(str, stdout);
+			free(str);
+		} else
+			return; // ENOMEM?
+
+	} else
+		printf("%ju", n_bytes);
 }
 
 static void mu_print_stat(const struct muinfo *pmui, char m)
@@ -413,7 +448,7 @@ static void mu_print_size(const struct muinfo *pmui, char const *string, char co
 				switch (fmt_char) {
 				case '\0':
 					--b;
-					FALLTHROUGH;
+					/* fallthrough */
 				case '%':
 					putchar('%');
 					break;
@@ -432,7 +467,7 @@ static void mu_print_size(const struct muinfo *pmui, char const *string, char co
 
 	if (opt_time) {
 		putchar('\t');
-		show_date(time_format, pmui->tmax, localtz);
+		show_date(time_format, pmui->tmax);
 	}
 	printf("\t%s%c", string, opt_nul_terminate_output ? '\0' : '\n');
 	fflush(stdout);
@@ -442,23 +477,41 @@ static void mu_print_size(const struct muinfo *pmui, char const *string, char co
 
 static void fill_mount_table(void)
 {
-	struct mount_entry *mnt_ent = read_file_system_list(false);
-	while (mnt_ent) {
-		struct mount_entry *mnt_free;
-		if (!mnt_ent->me_remote && !mnt_ent->me_dummy) {
-			struct stat buf;
-			if (!stat(mnt_ent->me_mountdir, &buf))
-				hash_ins(di_mnt, buf.st_ino, buf.st_dev);
-			else {
-				/* Ignore stat failure.  False positives are too common.
-				   E.g., "Permission denied" on /run/user/<name>/gvfs.  */
-			}
-		}
+	struct libmnt_context *cxt;
+	struct libmnt_table *tb;
+	struct libmnt_iter *itr = NULL;
+	struct libmnt_fs *fs;
 
-		mnt_free = mnt_ent;
-		mnt_ent = mnt_ent->me_next;
-		free_mount_entry(mnt_free);
+	cxt = mnt_new_context();
+	if (!cxt)
+		err(EXIT_FAILURE, _("failed to initialize libmount context"));
+
+	mnt_context_enable_noautofs(cxt, 1);
+
+	if (mnt_context_get_mtab(cxt, &tb))
+		err(EXIT_FAILURE, _("failed to read mount table"));
+
+	itr = mnt_new_iter(MNT_ITER_FORWARD);
+	if (!itr)
+		err(EXIT_FAILURE, _("failed to initialize libmount iterator"));
+
+	while (mnt_table_next_fs(tb, itr, &fs) == 0) {
+		const char *target;
+		struct stat buf;
+
+		if (!mnt_fs_is_regularfs(fs))
+			continue;
+
+		target = mnt_fs_get_target(fs);
+
+		if (!stat(target, &buf))
+			hash_ins(&di_mnt, buf.st_ino, buf.st_dev);
+
+		/* Ignore stat failure.  False positives are too common.
+		   E.g., "Permission denied" on /run/user/<name>/gvfs.  */
 	}
+
+	mnt_free_iter(itr);
 }
 
 /* This function checks whether any of the directories in the cycle that
@@ -467,24 +520,61 @@ static void fill_mount_table(void)
 static bool mount_point_in_fts_cycle(FTSENT const *ent)
 {
 	FTSENT const *cycle_ent = ent->fts_cycle;
+	static bool initialized;
 
-	if (!di_mnt) {
+	if (!initialized) {
 		/* Initialize the set of dev,inode pairs.  */
-		di_mnt = di_set_alloc();
-		if (!di_mnt)
+		if (!hcreate_r(SET_SIZE, &di_mnt))
 			xalloc_die();
 
 		fill_mount_table();
+
+		initialized = true;
 	}
 
 	while (ent && ent != cycle_ent) {
-		if (di_set_lookup(di_mnt, ent->fts_statp->st_dev, ent->fts_statp->st_ino) > 0) {
+		char dev_s[32];
+		ENTRY key;
+
+		snprintf(dev_s, sizeof(dev_s), "%ju,%ju", (uintmax_t)ent->fts_statp->st_dev, (uintmax_t)ent->fts_statp->st_ino);
+		key.key = dev_s;
+
+		if (hsearch_r(key, FIND, NULL, &di_mnt))
 			return true;
-		}
 		ent = ent->fts_parent;
 	}
 
 	return false;
+}
+
+/* Return *ST's access time.  */
+static struct timespec
+get_stat_atime (struct stat const *st)
+{
+	return (struct timespec) {
+		.tv_sec = st->st_atime,
+		.tv_nsec = st->st_atim.tv_nsec,
+	};
+}
+
+/* Return *ST's status change time.  */
+static struct timespec
+get_stat_ctime (struct stat const *st)
+{
+	return (struct timespec) {
+		.tv_sec = st->st_ctime,
+		.tv_nsec = st->st_ctim.tv_nsec,
+	};
+}
+
+/* Return *ST's data modification time.  */
+static struct timespec
+get_stat_mtime (struct stat const *st)
+{
+	return (struct timespec) {
+		.tv_sec = st->st_mtime,
+		.tv_nsec = st->st_mtim.tv_nsec,
+	};
 }
 
 static bool
@@ -501,7 +591,7 @@ get_file_cachestat(const FTSENT *ent, const struct stat *sb, enum time_type tt, 
 		goto out_time;
 	}
 
-	fd = open(filename, O_RDONLY, 0400);
+	fd = openat(call_dir, filename, O_RDONLY, 0400);
 	if (fd == -1) {
 		/* UNIX domain socket file */
 		if (errno == ENXIO) {
@@ -576,48 +666,45 @@ static bool process_file(FTS *fts, FTSENT *ent, char const *format)
 
 	if (info == FTS_DNR) {
 		/* An error occurred, but the size is known, so count it.  */
-		error(0, ent->fts_errno, _("cannot read directory %s"), quoteaf(file));
+		// TODO: restore quoting?
+		error(0, ent->fts_errno, _("cannot read directory %s"), file);
 		ok = false;
 	} else if (info != FTS_DP) {
-		bool excluded = excluded_file_name(exclude, file);
-		if (!excluded) {
-			/* Make the stat buffer *SB valid, or fail noisily.  */
+		/* Make the stat buffer *SB valid, or fail noisily.  */
 
-			if (info == FTS_NSOK) {
-				fts_set(fts, ent, FTS_AGAIN);
-				MAYBE_UNUSED FTSENT const *e = fts_read(fts);
-				affirm(e == ent);
-				info = ent->fts_info;
-			}
-
-			if (info == FTS_NS || info == FTS_SLNONE) {
-				error(0, ent->fts_errno, _("cannot access %s"), quoteaf(file));
-				return false;
-			}
-
-			/* The --one-file-system (-x) option cannot exclude anything
-			   specified on the command-line.  By definition, it can exclude
-			   a file or directory only when its device number is different
-			   from that of its just-processed parent directory, and mu does
-			   not process the parent of a command-line argument.  */
-			if (fts->fts_options & FTS_XDEV
-			    && FTS_ROOTLEVEL < ent->fts_level && fts->fts_dev != sb->st_dev)
-				excluded = true;
+		if (info == FTS_NSOK) {
+			fts_set(fts, ent, FTS_AGAIN);
+			FTSENT const *e = fts_read(fts);
+			assert(e == ent);
+			info = ent->fts_info;
 		}
 
-		if (excluded
-		    || (!opt_count_all && (hash_all || (!S_ISDIR(sb->st_mode) && 1 < sb->st_nlink))
-			&& !hash_ins(di_files, sb->st_ino, sb->st_dev))) {
-			/* If ignoring a directory in preorder, skip its children.
-			   Ignore the next fts_read output too, as it's a postorder
-			   visit to the same directory.  */
-			if (info == FTS_D) {
-				fts_set(fts, ent, FTS_SKIP);
-				MAYBE_UNUSED FTSENT const *e = fts_read(fts);
-				affirm(e == ent);
-			}
+		if (info == FTS_NS || info == FTS_SLNONE) {
+			// TODO: restore quoting?
+			error(0, ent->fts_errno, _("cannot access %s"), file);
+			return false;
+		}
 
-			return true;
+		/* The --one-file-system (-x) option cannot exclude anything
+		   specified on the command-line.  By definition, it can exclude
+		   a file or directory only when its device number is different
+		   from that of its just-processed parent directory, and mu does
+		   not process the parent of a command-line argument.  */
+		if (fts->fts_options & FTS_XDEV
+		    && FTS_ROOTLEVEL < ent->fts_level && fts->fts_dev != sb->st_dev) {
+			if (!opt_count_all && (hash_all || (!S_ISDIR(sb->st_mode) && 1 < sb->st_nlink))
+			    && !hash_ins(&di_files, sb->st_ino, sb->st_dev)) {
+				/* If ignoring a directory in preorder, skip its children.
+				   Ignore the next fts_read output too, as it's a postorder
+				   visit to the same directory.  */
+				if (info == FTS_D) {
+					fts_set(fts, ent, FTS_SKIP);
+					FTSENT const *e = fts_read(fts);
+					assert(e == ent);
+				}
+
+				return true;
+			}
 		}
 
 		switch (info) {
@@ -626,7 +713,8 @@ static bool process_file(FTS *fts, FTSENT *ent, char const *format)
 
 		case FTS_ERR:
 			/* An error occurred, but the size is known, so count it.  */
-			error(0, ent->fts_errno, "%s", quotef(file));
+			// TODO: restore quoting?
+			error(0, ent->fts_errno, "%s", file);
 			ok = false;
 			break;
 
@@ -634,7 +722,12 @@ static bool process_file(FTS *fts, FTSENT *ent, char const *format)
 			/* If not following symlinks and not a (bind) mount point.  */
 			if (cycle_warning_required(fts, ent)
 			    && !mount_point_in_fts_cycle(ent)) {
-				emit_cycle_warning(file);
+				error (0, 0, _(
+					"WARNING: Circular directory structure.\n"
+					"This almost certainly means that you have a corrupted file system.\n"
+					"NOTIFY YOUR SYSTEM MANAGER.\n"
+					"The following directory is part of the cycle:\n  %s\n"),
+					file);
 				return false;
 			}
 			return true;
@@ -650,7 +743,7 @@ static bool process_file(FTS *fts, FTSENT *ent, char const *format)
 
 	if (n_alloc == 0) {
 		n_alloc = level + 10;
-		mulvl = xcalloc(n_alloc, sizeof *mulvl);
+		mulvl = calloc(n_alloc, sizeof *mulvl);
 	} else {
 		if (level == prev_level) {
 			/* This is usually the most common case.  Do nothing.  */
@@ -661,7 +754,7 @@ static bool process_file(FTS *fts, FTSENT *ent, char const *format)
 			   e.g., from 1 to 10.  */
 
 			if (n_alloc <= level) {
-				mulvl = xnrealloc(mulvl, level, 2 * sizeof *mulvl);
+				mulvl = reallocarray(mulvl, level, 2 * sizeof *mulvl);
 				n_alloc = level * 2;
 			}
 
@@ -676,7 +769,7 @@ static bool process_file(FTS *fts, FTSENT *ent, char const *format)
 			   propagate sums from the children (prev_level) to the parent.
 			   Here, the current level is always one smaller than the
 			   previous one.  */
-			affirm(level == prev_level - 1);
+			assert(level == prev_level - 1);
 
 			muinfo_add(&mui_to_print, &mulvl[prev_level].ent);
 			if (!opt_separate_dirs)
@@ -720,16 +813,21 @@ static bool mu_files(char **files, int bit_flags, char const *format)
 	bool ok = true;
 
 	if (*files) {
-		FTS *fts = xfts_open(files, bit_flags, nullptr);
+		FTS *fts = fts_open(files, bit_flags, NULL);
+
+		if (!fts) {
+			error(0, errno, _("fts_open failed"));
+			return false;
+		}
 
 		while (true) {
 			FTSENT *ent;
 
 			ent = fts_read(fts);
-			if (ent == nullptr) {
+			if (ent == NULL) {
 				if (errno != 0) {
-					error(0, errno, _("fts_read failed: %s"),
-					      quotef(fts->fts_path));
+					// TODO: restore quoting?
+					error(0, errno, _("fts_read failed: %s"), fts->fts_path);
 					ok = false;
 				}
 
@@ -755,13 +853,13 @@ static bool mu_files(char **files, int bit_flags, char const *format)
 
 int main(int argc, char **argv)
 {
-	char *cwd_only[2];
 	bool max_depth_specified = false;
 	bool ok = true;
-	char *files_from = nullptr;
+	char *files_from = NULL;
 
 	/* Bit flags that control how fts works.  */
-	int bit_flags = FTS_NOSTAT;
+	//int bit_flags = FTS_NOSTAT;
+	int bit_flags = 0;
 
 	/* Select one of the three FTS_ options that control if/when
 	   to follow a symlink.  */
@@ -770,28 +868,19 @@ int main(int argc, char **argv)
 	/* If true, display only a total for each argument. */
 	bool opt_summarize_only = false;
 
-	cwd_only[0] = bad_cast(".");
-	cwd_only[1] = nullptr;
-
-	initialize_main(&argc, &argv);
-	set_program_name(argv[0]);
 	setlocale(LC_ALL, "");
 	bindtextdomain(PACKAGE, LOCALEDIR);
 	textdomain(PACKAGE);
 
-	atexit(close_stdout);
-
-	exclude = new_exclude();
-
-	human_options(getenv("MU_BLOCK_SIZE"), &human_output_opts, &output_block_size);
+	close_stdout_atexit();
 
 	muinfo_init(&tot_mui);
 
-	char *format = nullptr;
+	char *format = NULL;
 
 	while (true) {
 		int oi = -1;
-		int c = getopt_long(argc, argv, "0abd:cf:hHklmst:xB:DLPSX:",
+		int c = getopt_long(argc, argv, "0ad:cf:hHlst:x:DLPS",
 				    long_options, &oi);
 		if (c == -1)
 			break;
@@ -811,11 +900,6 @@ int main(int argc, char **argv)
 			opt_all = true;
 			break;
 
-		case 'b':
-			human_output_opts = 0;
-			output_block_size = 1;
-			break;
-
 		case 'c':
 			print_grand_total = true;
 			break;
@@ -825,37 +909,12 @@ int main(int argc, char **argv)
 			break;
 
 		case 'h':
-			human_output_opts = human_autoscale | human_SI | human_base_1024;
-			output_block_size = 1;
-			break;
-
-		case HUMAN_SI_OPTION:
-			human_output_opts = human_autoscale | human_SI;
-			output_block_size = 1;
-			break;
-
-		case 'k':
-			human_output_opts = 0;
-			output_block_size = 1024;
+			human_readable = 1;
 			break;
 
 		case 'd':	/* --max-depth=N */
-			{
-				intmax_t tmp;
-				if (xstrtoimax(optarg, nullptr, 0, &tmp, "") == LONGINT_OK
-				    && tmp <= IDX_MAX) {
-					max_depth_specified = true;
-					max_depth = tmp;
-				} else {
-					error(0, 0, _("invalid maximum depth %s"), quote(optarg));
-					ok = false;
-				}
-			}
-			break;
-
-		case 'm':
-			human_output_opts = 0;
-			output_block_size = 1024 * 1024;
+			max_depth_specified = true;
+			max_depth = strtoimax(optarg, NULL, 0);
 			break;
 
 		case 'l':
@@ -867,9 +926,11 @@ int main(int argc, char **argv)
 			break;
 
 		case 't':
+			opt_threshold = strtoimax(optarg, NULL, 0);
+#if 0
 			{
 				enum strtol_error e;
-				e = xstrtoimax(optarg, nullptr, 0, &opt_threshold, "kKmMGTPEZYRQ0");
+				e = xstrtoimax(optarg, NULL, 0, &opt_threshold, "kKmMGTPEZYRQ0");
 				if (e != LONGINT_OK)
 					xstrtol_fatal(e, oi, c, long_options, optarg);
 				if (opt_threshold == 0 && *optarg == '-') {
@@ -878,19 +939,11 @@ int main(int argc, char **argv)
 					      _("invalid --threshold argument '-0'"));
 				}
 			}
+#endif
 			break;
 
 		case 'x':
 			bit_flags |= FTS_XDEV;
-			break;
-
-		case 'B':
-			{
-				enum strtol_error e = human_options(optarg, &human_output_opts,
-								    &output_block_size);
-				if (e != LONGINT_OK)
-					xstrtol_fatal(e, oi, c, long_options, optarg);
-			}
 			break;
 
 		case 'H':	/* NOTE: before 2008-12, -H was equivalent to --si.  */
@@ -910,35 +963,24 @@ int main(int argc, char **argv)
 			opt_separate_dirs = true;
 			break;
 
-		case 'X':
-			if (add_exclude_file(add_exclude, exclude, optarg, EXCLUDE_WILDCARDS, '\n')) {
-				error(0, errno, "%s", quotef(optarg));
-				ok = false;
-			}
-			break;
-
-		case FILES0_FROM_OPTION:
-			files_from = optarg;
-			break;
-
-		case EXCLUDE_OPTION:
-			add_exclude(exclude, optarg, EXCLUDE_WILDCARDS);
-			break;
-
 		case TIME_OPTION:
 			opt_time = true;
-			time_type = (optarg ? XARGMATCH("--time", optarg, time_args, time_types)
-				     : time_mtime);
-			localtz = tzalloc(getenv("TZ"));
+			for (unsigned long i = 0; i < ARRAY_SIZE(time_args); i++)
+				if (streq(optarg, time_args[i])) {
+					time_type = time_types[i];
+					break;
+				}
 			break;
 
 		case TIME_STYLE_OPTION:
 			time_style = optarg;
 			break;
 
-			case_GETOPT_HELP_CHAR;
-
-			case_GETOPT_VERSION_CHAR(PROGRAM_NAME, AUTHORS);
+		case CHAR_MIN - 2:
+			/* fallthrough */
+		case CHAR_MIN - 3:
+			exit (EXIT_SUCCESS);
+			break;
 
 		default:
 			ok = false;
@@ -971,7 +1013,7 @@ int main(int argc, char **argv)
 			time_style = getenv("TIME_STYLE");
 
 			/* Ignore TIMESTYLE="locale", for compatibility with ls.  */
-			if (!time_style || STREQ(time_style, "locale"))
+			if (!time_style || streq(time_style, "locale"))
 				time_style = "long-iso";
 			else if (*time_style == '+') {
 				/* Ignore anything after a newline, for compatibility
@@ -983,7 +1025,7 @@ int main(int argc, char **argv)
 				/* Ignore "posix-" prefix, for compatibility with ls.  */
 				static char const posix_prefix[] = "posix-";
 				static const size_t prefix_len = sizeof posix_prefix - 1;
-				while (STREQ_LEN(time_style, posix_prefix, prefix_len))
+				while (strncmp(time_style, posix_prefix, prefix_len) == 0)
 					time_style += prefix_len;
 			}
 		}
@@ -991,8 +1033,13 @@ int main(int argc, char **argv)
 		if (*time_style == '+')
 			time_format = time_style + 1;
 		else {
-			switch (XARGMATCH("time style", time_style,
-					  time_style_args, time_style_types)) {
+			enum time_style time_style = long_iso_time_style;
+			for (unsigned long i = 0; i < ARRAY_SIZE(time_style_args); i++)
+				if (streq(optarg, time_style_args[i])) {
+					time_style = time_style_types[i];
+					break;
+				}
+			switch (time_style) {
 			case full_iso_time_style:
 				time_format = "%Y-%m-%d %H:%M:%S.%N %z";
 				break;
@@ -1008,117 +1055,43 @@ int main(int argc, char **argv)
 		}
 	}
 
-	struct argv_iterator *ai;
-	if (files_from) {
-		/* When using --files0-from=F, you may not specify any files
-		   on the command-line.  */
-		if (optind < argc) {
-			error(0, 0, _("extra operand %s"), quote(argv[optind]));
-			fprintf(stderr, "%s\n",
-				_("file operands cannot be combined with --files0-from"));
-			usage(EXIT_FAILURE);
-		}
-
-		if (!(STREQ(files_from, "-") || freopen(files_from, "r", stdin)))
-			error(EXIT_FAILURE, errno, _("cannot open %s for reading"),
-			      quoteaf(files_from));
-
-		ai = argv_iter_init_stream(stdin);
-
-		/* It's not easy here to count the arguments, so assume the
-		   worst.  */
-		hash_all = true;
-	} else {
-		char **files = (optind < argc ? argv + optind : cwd_only);
-		ai = argv_iter_init_argv(files);
-
-		/* Hash all dev,ino pairs if there are multiple arguments, or if
-		   following non-command-line symlinks, because in either case a
-		   file with just one hard link might be seen more than once.  */
-		hash_all = (optind + 1 < argc || symlink_deref_bits == FTS_LOGICAL);
-	}
-
-	if (!ai)
-		xalloc_die();
+	/* Hash all dev,ino pairs if there are multiple arguments, or if
+	   following non-command-line symlinks, because in either case a
+	   file with just one hard link might be seen more than once.  */
+	hash_all = (optind + 1 < argc || symlink_deref_bits == FTS_LOGICAL);
 
 	/* Initialize the set of dev,inode pairs.  */
-	di_files = di_set_alloc();
-	if (!di_files)
+	if (!hcreate_r(SET_SIZE, &di_files))
 		xalloc_die();
 
 	/* If not hashing everything, process_file won't find cycles on its
 	   own, so ask fts_read to check for them accurately.  */
+/*	FIXME:
 	if (opt_count_all || !hash_all)
 		bit_flags |= FTS_TIGHT_CYCLE_CHECK;
+*/
 
 	bit_flags |= symlink_deref_bits;
-	static char *temp_argv[] = { nullptr, nullptr };
+	static char *temp_argv[] = { NULL, NULL };
 
-	while (true) {
-		bool skip_file = false;
-		enum argv_iter_err ai_err;
-		char *file_name = argv_iter(ai, &ai_err);
-		if (!file_name) {
-			switch (ai_err) {
-			case AI_ERR_EOF:
-				goto argv_iter_done;
-			case AI_ERR_READ:
-				error(0, errno, _("%s: read error"), quotef(files_from));
-				ok = false;
-				goto argv_iter_done;
-			case AI_ERR_MEM:
-				xalloc_die();
-			case AI_ERR_OK:
-			default:
-				affirm(!"unexpected error code from argv_iter");
-			}
-		}
-		if (files_from && STREQ(files_from, "-") && STREQ(file_name, "-")) {
-			/* Give a better diagnostic in an unusual case:
-			   printf - | du --files0-from=- */
-			error(0, 0, _("when reading file names from stdin, "
-				      "no file name of %s allowed"), quoteaf(file_name));
-			skip_file = true;
-		}
+	call_dir = open(".", O_PATH | O_DIRECTORY);
 
-		/* Report and skip any empty file names before invoking fts.
-		   This works around a glitch in fts, which fails immediately
-		   (without looking at the other file names) when given an empty
-		   file name.  */
-		if (!file_name[0]) {
-			/* Diagnose a zero-length file name.  When it's one
-			   among many, knowing the record number may help.
-			   FIXME: currently print the record number only with
-			   --files0-from=FILE.  Maybe do it for argv, too?  */
-			if (files_from == nullptr)
-				error(0, 0, "%s", _("invalid zero-length file name"));
-			else {
-				/* Using the standard 'filename:line-number:' prefix here is
-				   not totally appropriate, since NUL is the separator, not NL,
-				   but it might be better than nothing.  */
-				idx_t file_number = argv_iter_n_args(ai);
-				error(0, 0, "%s:%td: %s", quotef(files_from),
-				      file_number, _("invalid zero-length file name"));
-			}
-			skip_file = true;
-		}
-
-		if (skip_file)
-			ok = false;
-		else {
-			temp_argv[0] = file_name;
+	if (optind == argc) {
+		temp_argv[0] = ".";
+		ok &= mu_files(temp_argv, bit_flags, format);
+	} else {
+		for (int i = optind; i < argc; i++) {
+			temp_argv[0] = argv[i];
 			ok &= mu_files(temp_argv, bit_flags, format);
 		}
 	}
- argv_iter_done:
 
-	argv_iter_free(ai);
-	di_set_free(di_files);
-	if (di_mnt)
-		di_set_free(di_mnt);
+	hdestroy_r(&di_files);
+	hdestroy_r(&di_mnt);
 
+	// TODO: restore quoting?
 	if (files_from && (ferror(stdin) || fclose(stdin) != 0) && ok)
-		error(EXIT_FAILURE, 0, _("error reading %s"), quoteaf(files_from));
+		error(EXIT_FAILURE, 0, _("error reading %s"), files_from);
 
 	if (print_grand_total) {
 		mu_print_size(&tot_mui, _("total"), format);
