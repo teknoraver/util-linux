@@ -14,10 +14,7 @@
    You should have received a copy of the GNU General Public License
    along with this program.  If not, see <https://www.gnu.org/licenses/>.  */
 
-#include <config.h>
-#include <getopt.h>
-#include <sys/types.h>
-
+/*
 #include "system.h"
 #include "argmatch.h"
 #include "argv-iter.h"
@@ -34,12 +31,24 @@
 #include "xfts.h"
 #include "xstrtol.h"
 #include "xstrtol-error.h"
+*/
+
+#include <config.h>
+#include <getopt.h>
+#include <sys/types.h>
+
+#include <stdbool.h>
+#include <stdint.h>
+#include <limits.h>
 
 #include <fcntl.h>
 #include <linux/mman.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
 #include <unistd.h>
+
+#include "c.h"
+#include "nls.h"
 
 extern bool fts_debug;
 
@@ -88,7 +97,7 @@ static inline void muinfo_init(struct muinfo *mui)
 	mui->writeback_size = 0;
 	mui->evicted_size = 0;
 	mui->recently_evicted_size = 0;
-	mui->tmax.tv_sec = TYPE_MINIMUM(time_t);
+	mui->tmax.tv_sec = (time_t)LLONG_MIN;
 	mui->tmax.tv_nsec = -1;
 }
 
@@ -109,7 +118,7 @@ static inline void muinfo_add(struct muinfo *first, const struct muinfo *second)
 	sum = first->recently_evicted_size + second->recently_evicted_size;
 	first->recently_evicted_size = first->recently_evicted_size <= sum ? sum : UINTMAX_MAX;
 
-	if (timespec_cmp(first->tmax, second->tmax) < 0)
+	if (cmp_timespec(&first->tmax, &second->tmax, <))
 		first->tmax = second->tmax;
 }
 
@@ -139,7 +148,7 @@ static bool opt_separate_dirs = false;
 /* Show the total for each directory (and file if --all) that is at
    most MAX_DEPTH levels down from the root of the hierarchy.  The root
    is at level 0, so 'mu --max-depth=0' is equivalent to 'mu -s'.  */
-static idx_t max_depth = IDX_MAX;
+static size_t max_depth = SIZE_MAX;
 
 /* Only output entries with at least this SIZE if positive,
    or at most if negative.  See --threshold option.  */
@@ -162,13 +171,10 @@ enum time_type {
 static enum time_type time_type = time_mtime;
 
 /* User specified date / time style */
-static char const *time_style = nullptr;
+static char const *time_style = NULL;
 
 /* Format used to display date / time. Controlled by --time-style */
-static char const *time_format = nullptr;
-
-/* The local time zone rules, as per the TZ environment variable.  */
-static timezone_t localtz;
+static char const *time_format = NULL;
 
 /* The units to use when printing sizes.  */
 static uintmax_t output_block_size;
@@ -194,43 +200,43 @@ enum {
 };
 
 static struct option const long_options[] = {
-	{"all", no_argument, nullptr, 'a'},
-	{"block-size", required_argument, nullptr, 'B'},
-	{"bytes", no_argument, nullptr, 'b'},
-	{"count-links", no_argument, nullptr, 'l'},
-	/* {"-debug", no_argument, nullptr, FTS_DEBUG}, */
-	{"dereference", no_argument, nullptr, 'L'},
-	{"dereference-args", no_argument, nullptr, 'D'},
-	{"exclude", required_argument, nullptr, EXCLUDE_OPTION},
-	{"exclude-from", required_argument, nullptr, 'X'},
-	{"files0-from", required_argument, nullptr, FILES0_FROM_OPTION},
-	{"human-readable", no_argument, nullptr, 'h'},
-	{"si", no_argument, nullptr, HUMAN_SI_OPTION},
-	{"max-depth", required_argument, nullptr, 'd'},
-	{"null", no_argument, nullptr, '0'},
-	{"no-dereference", no_argument, nullptr, 'P'},
-	{"one-file-system", no_argument, nullptr, 'x'},
-	{"separate-dirs", no_argument, nullptr, 'S'},
-	{"summarize", no_argument, nullptr, 's'},
-	{"total", no_argument, nullptr, 'c'},
-	{"threshold", required_argument, nullptr, 't'},
-	{"time", optional_argument, nullptr, TIME_OPTION},
-	{"time-style", required_argument, nullptr, TIME_STYLE_OPTION},
-	{"format", required_argument, nullptr, 'f'},
-	{GETOPT_HELP_OPTION_DECL},
-	{GETOPT_VERSION_OPTION_DECL},
-	{nullptr, 0, nullptr, 0}
+	{"all", no_argument, NULL, 'a'},
+	{"block-size", required_argument, NULL, 'B'},
+	{"bytes", no_argument, NULL, 'b'},
+	{"count-links", no_argument, NULL, 'l'},
+	/* {"-debug", no_argument, NULL, FTS_DEBUG}, */
+	{"dereference", no_argument, NULL, 'L'},
+	{"dereference-args", no_argument, NULL, 'D'},
+	{"exclude", required_argument, NULL, EXCLUDE_OPTION},
+	{"exclude-from", required_argument, NULL, 'X'},
+	{"files0-from", required_argument, NULL, FILES0_FROM_OPTION},
+	{"human-readable", no_argument, NULL, 'h'},
+	{"si", no_argument, NULL, HUMAN_SI_OPTION},
+	{"max-depth", required_argument, NULL, 'd'},
+	{"null", no_argument, NULL, '0'},
+	{"no-dereference", no_argument, NULL, 'P'},
+	{"one-file-system", no_argument, NULL, 'x'},
+	{"separate-dirs", no_argument, NULL, 'S'},
+	{"summarize", no_argument, NULL, 's'},
+	{"total", no_argument, NULL, 'c'},
+	{"threshold", required_argument, NULL, 't'},
+	{"time", optional_argument, NULL, TIME_OPTION},
+	{"time-style", required_argument, NULL, TIME_STYLE_OPTION},
+	{"format", required_argument, NULL, 'f'},
+	{"help", no_argument, NULL, CHAR_MIN - 2},
+	{"version", no_argument, NULL, CHAR_MIN - 3},
+	{NULL, 0, NULL, 0}
 };
 
 static char const *const time_args[] = {
-	"atime", "access", "use", "ctime", "status", nullptr
+	"atime", "access", "use", "ctime", "status", NULL
 };
 
 static enum time_type const time_types[] = {
 	time_atime, time_atime, time_atime, time_ctime, time_ctime
 };
 
-ARGMATCH_VERIFY(time_args, time_types);
+static_assert(ARRAY_SIZE(time_args) == ARRAY_SIZE(time_types) + 1);
 
 /* 'full-iso' uses full ISO-style dates and times.  'long-iso' uses longer
    ISO-style timestamps, though shorter than 'full-iso'.  'iso' uses shorter
@@ -242,20 +248,20 @@ enum time_style {
 };
 
 static char const *const time_style_args[] = {
-	"full-iso", "long-iso", "iso", nullptr
+	"full-iso", "long-iso", "iso", NULL
 };
 
 static enum time_style const time_style_types[] = {
 	full_iso_time_style, long_iso_time_style, iso_time_style
 };
 
-ARGMATCH_VERIFY(time_style_args, time_style_types);
+static_assert(ARRAY_SIZE(time_style_args) == ARRAY_SIZE(time_style_types) + 1);
 
-void usage(int status)
+static void usage(int status)
 {
-	if (status != EXIT_SUCCESS)
-		emit_try_help();
-	else {
+	if (status != EXIT_SUCCESS) {
+		fputs(_("Try '" PROGRAM_NAME " --help' for more information.\n"), stderr);
+	} else {
 		printf(_("\
 Usage: %s [OPTION]... [FILE]...\n\
   or:  %s [OPTION]... --files0-from=F\n\
@@ -357,11 +363,11 @@ static bool hash_ins(struct di_set *di_set, ino_t ino, dev_t dev)
 /* Display the date and time in WHEN according to the format specified
    in FORMAT.  */
 
-static void show_date(char const *format, struct timespec when, timezone_t tz)
+static void show_date(char const *format, struct timespec when)
 {
 	struct tm tm;
-	if (localtime_rz(tz, &when.tv_sec, &tm))
-		fprintftime(stdout, format, &tm, tz, when.tv_nsec);
+	if (localtime_r(&when.tv_sec, &tm))
+		fprintftime(stdout, format, &tm, NULL, when.tv_nsec);
 	else {
 		char buf[INT_BUFSIZE_BOUND(intmax_t)];
 		char *when_str = timetostr(when.tv_sec, buf);
@@ -432,7 +438,7 @@ static void mu_print_size(const struct muinfo *pmui, char const *string, char co
 
 	if (opt_time) {
 		putchar('\t');
-		show_date(time_format, pmui->tmax, localtz);
+		show_date(time_format, pmui->tmax, local);
 	}
 	printf("\t%s%c", string, opt_nul_terminate_output ? '\0' : '\n');
 	fflush(stdout);
@@ -720,13 +726,13 @@ static bool mu_files(char **files, int bit_flags, char const *format)
 	bool ok = true;
 
 	if (*files) {
-		FTS *fts = xfts_open(files, bit_flags, nullptr);
+		FTS *fts = xfts_open(files, bit_flags, NULL);
 
 		while (true) {
 			FTSENT *ent;
 
 			ent = fts_read(fts);
-			if (ent == nullptr) {
+			if (ent == NULL) {
 				if (errno != 0) {
 					error(0, errno, _("fts_read failed: %s"),
 					      quotef(fts->fts_path));
@@ -758,7 +764,7 @@ int main(int argc, char **argv)
 	char *cwd_only[2];
 	bool max_depth_specified = false;
 	bool ok = true;
-	char *files_from = nullptr;
+	char *files_from = NULL;
 
 	/* Bit flags that control how fts works.  */
 	int bit_flags = FTS_NOSTAT;
@@ -771,7 +777,7 @@ int main(int argc, char **argv)
 	bool opt_summarize_only = false;
 
 	cwd_only[0] = bad_cast(".");
-	cwd_only[1] = nullptr;
+	cwd_only[1] = NULL;
 
 	initialize_main(&argc, &argv);
 	set_program_name(argv[0]);
@@ -787,7 +793,7 @@ int main(int argc, char **argv)
 
 	muinfo_init(&tot_mui);
 
-	char *format = nullptr;
+	char *format = NULL;
 
 	while (true) {
 		int oi = -1;
@@ -842,7 +848,7 @@ int main(int argc, char **argv)
 		case 'd':	/* --max-depth=N */
 			{
 				intmax_t tmp;
-				if (xstrtoimax(optarg, nullptr, 0, &tmp, "") == LONGINT_OK
+				if (xstrtoimax(optarg, NULL, 0, &tmp, "") == LONGINT_OK
 				    && tmp <= IDX_MAX) {
 					max_depth_specified = true;
 					max_depth = tmp;
@@ -869,7 +875,7 @@ int main(int argc, char **argv)
 		case 't':
 			{
 				enum strtol_error e;
-				e = xstrtoimax(optarg, nullptr, 0, &opt_threshold, "kKmMGTPEZYRQ0");
+				e = xstrtoimax(optarg, NULL, 0, &opt_threshold, "kKmMGTPEZYRQ0");
 				if (e != LONGINT_OK)
 					xstrtol_fatal(e, oi, c, long_options, optarg);
 				if (opt_threshold == 0 && *optarg == '-') {
@@ -1052,7 +1058,7 @@ int main(int argc, char **argv)
 		bit_flags |= FTS_TIGHT_CYCLE_CHECK;
 
 	bit_flags |= symlink_deref_bits;
-	static char *temp_argv[] = { nullptr, nullptr };
+	static char *temp_argv[] = { NULL, NULL };
 
 	while (true) {
 		bool skip_file = false;
@@ -1090,13 +1096,13 @@ int main(int argc, char **argv)
 			   among many, knowing the record number may help.
 			   FIXME: currently print the record number only with
 			   --files0-from=FILE.  Maybe do it for argv, too?  */
-			if (files_from == nullptr)
+			if (files_from == NULL) {
 				error(0, 0, "%s", _("invalid zero-length file name"));
-			else {
+			} else {
 				/* Using the standard 'filename:line-number:' prefix here is
 				   not totally appropriate, since NUL is the separator, not NL,
 				   but it might be better than nothing.  */
-				idx_t file_number = argv_iter_n_args(ai);
+				size_t file_number = argv_iter_n_args(ai);
 				error(0, 0, "%s:%td: %s", quotef(files_from),
 				      file_number, _("invalid zero-length file name"));
 			}
